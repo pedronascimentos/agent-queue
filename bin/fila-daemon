@@ -139,18 +139,26 @@ def ciclo(ocupado_antes):
         apagar, e["apagar"] = e["apagar"], []
         agora = time.time()
         for r in fila.RECURSOS:
-            d = e["dono"][r]
-            if d and agora > d["ate"]:
+            for d in [d for d in e["dono"][r] if agora > d["ate"]]:
                 log(f"PRAZO vencido {r} {d['agente']}: liberado")
                 avisar(d["agente"], f"[fila] seu prazo do {r} venceu e a vez passou adiante. "
                                     f"Se ainda precisa: `fila entrar {d['agente']} -r {r}`.")
-                e["dono"][r] = None
-            if e["dono"][r] is None and r == "emulador":
+                e["dono"][r].remove(d)
+            if not e["dono"][r] and r == "emulador":
                 rm_lock()
-        pend = [(r, e["fila"][r].pop(0)) for r in fila.RECURSOS if e["dono"][r] is None and e["fila"][r]]
-        for r, item in pend:
-            item["preparando"] = True; item["ate"] = time.time() + 600
-            e["dono"][r] = item
+        pend = []
+        ram = ram_livre()
+        for r in fila.RECURSOS:
+            cap = int(C.get("capacity", {}).get(r, 1))
+            while e["fila"][r] and len(e["dono"][r]) < cap:
+                prox = e["fila"][r][0]
+                # sharing a resource: only if the new one's RAM still fits (keeps a 1.5 GB margin)
+                if e["dono"][r] and ram < float(prox.get("ram", 4)) + 1.5:
+                    break
+                item = e["fila"][r].pop(0)
+                ram -= float(item.get("ram", 4))
+                item["preparando"] = True; item["ate"] = time.time() + 600
+                e["dono"][r].append(item); pend.append((r, item))
     for c in apagar:
         if fila.caminho_ok(c):
             if os.path.isdir(c):
@@ -162,8 +170,7 @@ def ciclo(ocupado_antes):
         conceder(r, item)
         item.pop("preparando", None)
         with fila.Travado() as e:
-            if e["dono"][r] and e["dono"][r]["agente"] == item["agente"]:
-                e["dono"][r] = item
+            e["dono"][r] = [item if d["agente"] == item["agente"] else d for d in e["dono"][r]]
     # sessions that must stay idle: interrupt (Esc) if busy on two checks in a row
     agora_ocupado = set()
     for s in KEEP_IDLE:

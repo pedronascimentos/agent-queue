@@ -20,6 +20,8 @@ CONF = os.path.expanduser(os.environ.get("FILA_CONFIG", "~/.config/fila/config.j
 DEFAULTS = {
     "state_dir": "~/.local/state/fila",
     "resources": ["emulador", "celular", "pesado"],
+    # how many agents may hold each resource at once (pesado also needs the RAM to fit)
+    "capacity": {"emulador": 1, "celular": 1, "pesado": 4},
     # paths agents may ask the daemon to delete on release
     "allowed_delete": ["~/Documentos/", "~/projects/", "~/.cache/", "/tmp/"],
     # never deleted, even if listed
@@ -71,7 +73,9 @@ class Travado:
         self.e = carregar()
         self.e.setdefault("fila", {}); self.e.setdefault("dono", {}); self.e.setdefault("apagar", [])
         for r in RECURSOS:
-            self.e["fila"].setdefault(r, []); self.e["dono"].setdefault(r, None)
+            self.e["fila"].setdefault(r, [])
+            d = self.e["dono"].get(r)
+            self.e["dono"][r] = [] if d is None else ([d] if isinstance(d, dict) else d)
         return self.e
 
     def __exit__(self, *a):
@@ -85,9 +89,9 @@ def hhmm(t):
 
 def onde(e, agente):
     for r in RECURSOS:
-        d = e["dono"][r]
-        if d and d["agente"] == agente:
-            return r, 0, d
+        for d in e["dono"][r]:
+            if d["agente"] == agente:
+                return r, 0, d
         for i, p in enumerate(e["fila"][r]):
             if p["agente"] == agente:
                 return r, i + 1, p
@@ -97,8 +101,7 @@ def onde(e, agente):
 def linha_status(e):
     out = []
     for r in RECURSOS:
-        d = e["dono"][r]
-        dono = f"{d['agente']} até {hhmm(d['ate'])}" if d else "livre"
+        dono = ", ".join(f"{d['agente']} até {hhmm(d['ate'])}" for d in e["dono"][r]) or "livre"
         esp = ",".join(p["agente"] for p in e["fila"][r]) or "-"
         out.append(f"{r}: {dono} | espera: {esp}")
     return "\n".join(out)
@@ -145,8 +148,8 @@ def main():
             if pos == 0:
                 print(f"FILA {'preparando' if item.get('preparando') else 'vez'} {r} até {hhmm(item['ate'])}")
             else:
-                d = e["dono"][r]
-                print(f"FILA pos {pos}/{len(e['fila'][r])} {r} (dono: {d['agente'] if d else 'livre'})")
+                donos = ",".join(d["agente"] for d in e["dono"][r]) or "livre"
+                print(f"FILA pos {pos}/{len(e['fila'][r])} {r} (usando: {donos})")
         return 0
 
     if a.cmd == "esperar":
@@ -182,7 +185,7 @@ def main():
             r, pos, item = onde(e, a.agente)
             if r is not None:
                 if pos == 0:
-                    e["dono"][r] = None
+                    e["dono"][r] = [d for d in e["dono"][r] if d["agente"] != a.agente]
                 else:
                     e["fila"][r] = [p for p in e["fila"][r] if p["agente"] != a.agente]
             e["apagar"].extend(ok)

@@ -36,7 +36,7 @@ fila status
 (English aliases: `join`, `wait`, `renew`, `leave`, `help`.) `AGENT` is the agent's tmux session name.
 
 Resources: `emulador` (Android emulator), `celular` (physical phone), `pesado` (heavy job, no device).
-Each has one holder at a time. Add more in `config.json` → `resources`.
+`capacity` in `config.json` sets how many agents may hold each resource at once (default: emulator 1, phone 1, heavy 4; a shared heavy slot is only granted if the new request still fits in free RAM). Add resources in `resources`.
 
 ## What the daemon frees before a turn
 

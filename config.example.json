@@ -1,11 +1,33 @@
 {
   "state_dir": "~/.local/state/fila",
-  "resources": ["emulador", "celular", "pesado"],
+  "resources": [
+    "emulador",
+    "celular",
+    "pesado"
+  ],
   "tmux_socket": "claude",
   "keeper_session": "recover",
   "keep_idle_sessions": [],
-  "rust_targets": ["~/projects/my-rust-app/target"],
+  "rust_targets": [
+    "~/projects/my-rust-app/target"
+  ],
   "emulator_lock": "/tmp/fila-emulador.lock",
-  "allowed_delete": ["~/Documentos/", "~/projects/", "~/.cache/", "/tmp/"],
-  "forbidden_delete": ["~/Downloads", "~/.claude", "~/.android/avd", "~/.ssh", "~/.config"]
+  "allowed_delete": [
+    "~/Documentos/",
+    "~/projects/",
+    "~/.cache/",
+    "/tmp/"
+  ],
+  "forbidden_delete": [
+    "~/Downloads",
+    "~/.claude",
+    "~/.android/avd",
+    "~/.ssh",
+    "~/.config"
+  ],
+  "capacity": {
+    "emulador": 1,
+    "celular": 1,
+    "pesado": 4
+  }
 }
