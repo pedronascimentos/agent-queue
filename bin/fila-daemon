@@ -19,6 +19,14 @@ KEEP_IDLE = C.get("keep_idle_sessions", [])       # sessions that must not work 
 RUST = [os.path.expanduser(p) for p in C.get("rust_targets", [])]
 EMU_LOCK = os.path.expanduser(C.get("emulator_lock", "/tmp/fila-emulador.lock"))
 GB = 1024 ** 3
+_ultimo_aviso = {}
+
+
+def avisar_keeper(chave, msg, cada=600):
+    """Ping the keeper at most once per `cada` seconds for the same agent/problem."""
+    if time.time() - _ultimo_aviso.get(chave, 0) >= cada:
+        _ultimo_aviso[chave] = time.time()
+        avisar(KEEPER, msg)
 
 
 def log(m):
@@ -72,6 +80,15 @@ def gradle_rodando():
     return False
 
 
+def rust_velho(minutos):
+    for t in RUST:
+        for d in (t + "/debug", t + "/release"):
+            sh(f"cd '{d}' 2>/dev/null || exit 0; for c in incremental/*/; do ls -dt \"$c\"s-* 2>/dev/null | tail -n +2 | "
+               f"while read s; do [ -n \"$(find \"$s\" -maxdepth 0 -mmin +{minutos})\" ] && rm -rf \"$s\"; done; done; "
+               "ls -t deps 2>/dev/null | grep -E '^[a-z0-9_]+-[0-9a-f]{16}$' | awk '{n=$0; sub(/-[0-9a-f]{16}$/,\"\",n); if (seen[n]++) print $0}' | "
+               f"while read f; do [ -x \"deps/$f\" ] && [ -n \"$(find \"deps/$f\" -mmin +{minutos})\" ] && rm -f \"deps/$f\" \"deps/$f.d\"; done")
+
+
 def limpar_disco(precisa):
     """Safe, regenerable cleanups, cheapest first, until `precisa` GB are free."""
     h = os.path.expanduser
@@ -81,10 +98,8 @@ def limpar_disco(precisa):
         ("Gradle per-version caches", lambda: None if gradle_rodando() else
             [shutil.rmtree(d, ignore_errors=True) for d in glob.glob(h("~/.gradle/caches/[0-9]*.[0-9]*"))
              + glob.glob(h("~/.gradle/caches/transforms-*")) + glob.glob(h("~/.gradle/caches/build-cache-*"))]),
-        ("stale Rust incremental (>2h)", lambda: [sh(
-            f"cd '{d}' 2>/dev/null && for c in incremental/*/; do ls -dt \"$c\"s-* 2>/dev/null | tail -n +2 | "
-            "while read s; do [ -n \"$(find \"$s\" -maxdepth 0 -mmin +120)\" ] && rm -rf \"$s\"; done; done")
-            for t in RUST for d in (t + "/debug", t + "/release")]),
+        ("stale Rust incremental (>2h)", lambda: rust_velho(120)),
+        ("superseded Rust artifacts (>15 min, disk emergency)", lambda: rust_velho(15) if disco_livre() < 3 else None),
     ]
     feito = []
     for nome, f in passos:
@@ -113,10 +128,16 @@ def conceder(r, item):
     feito += liberar_ram(pr, r)
     rl, dl = round(ram_livre(), 1), round(disco_livre(), 1)
     aviso = ""
-    if rl < pr or dl < pd:
-        aviso = f"curto(pediu ram {pr}G disco {pd}G)"
-        avisar(KEEPER, f"[fila] {ag} recebeu {r} mas falta recurso: RAM livre {rl}G (pediu {pr}G), disco livre {dl}G "
-                       f"(pediu {pd}G). Libere o que for seguro e responda nada; o daemon segue sozinho.")
+    if dl < pd:
+        # not enough disk even after cleanup: keep waiting (a full disk breaks everyone), ask the keeper
+        avisar_keeper("disco", f"[fila] disco curto: {dl}G livres, {ag} pediu {pd}G para {r} e está esperando. "
+                               f"Libere o que for seguro e responda nada; o daemon segue sozinho.")
+        log(f"ESPERA {r} {ag}: disco {dl}G < {pd}G")
+        return False
+    if rl < pr:
+        aviso = f"ram_curta(pediu {pr}G)"
+        avisar_keeper("ram-" + ag, f"[fila] {ag} recebeu {r} com pouca RAM: {rl}G livres (pediu {pr}G). "
+                                   f"Libere o que for seguro e responda nada; o daemon segue sozinho.")
     item.update({"ate": time.time() + 60 * int(item.get("min", 45)), "visto": time.time(),
                  "ram_livre": rl, "disco_livre": dl, "aviso": aviso, "inicio": time.time()})
     log(f"VEZ {r} -> {ag} ram {rl}G disco {dl}G {('feito: ' + ', '.join(feito)) if feito else ''} {aviso}")
@@ -125,6 +146,7 @@ def conceder(r, item):
             f.write(f"{ag} fila até {fila.hhmm(item['ate'])}\n")
     avisar(ag, f"[fila] SUA VEZ: {r} até {fila.hhmm(item['ate'])} (RAM livre {rl}G, disco {dl}G). "
                f"Use agora; renove com `fila renovar {ag}`; ao terminar: salve e rode `fila sair {ag} --apagar <o que pode apagar>`.")
+    return True
 
 
 def rm_lock():
@@ -167,10 +189,16 @@ def ciclo(ocupado_antes):
                 os.remove(c)
             log(f"APAGADO {c}")
     for r, item in pend:
-        conceder(r, item)
+        ok = conceder(r, item)
         item.pop("preparando", None)
         with fila.Travado() as e:
-            e["dono"][r] = [item if d["agente"] == item["agente"] else d for d in e["dono"][r]]
+            if ok:
+                e["dono"][r] = [item if d["agente"] == item["agente"] else d for d in e["dono"][r]]
+            else:
+                e["dono"][r] = [d for d in e["dono"][r] if d["agente"] != item["agente"]]
+                e["fila"][r].insert(0, item)
+        if not ok:
+            time.sleep(20)   # give cleanups/agents time before retrying
     # sessions that must stay idle: interrupt (Esc) if busy on two checks in a row
     agora_ocupado = set()
     for s in KEEP_IDLE:

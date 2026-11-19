@@ -43,7 +43,7 @@ Resources: `emulador` (Android emulator), `celular` (physical phone), `pesado` (
 Disk, cheapest first and only until the request fits: npm cache → Docker build cache and dangling images →
 Gradle per-version caches (only when no Gradle is running) → stale Rust incremental dirs (> 2 h) in `rust_targets`.
 RAM: drops page cache; for an emulator turn, stops orphan emulators. Nothing else is killed.
-If it's still short, it messages `keeper_session` and grants anyway with a warning.
+If disk is still short the request keeps waiting (a full disk breaks every agent) and the keeper is pinged (at most once per 10 min); if only RAM is short it is granted with a warning. In a disk emergency (< 3 GB) superseded Rust artifacts older than 15 min are trimmed too.
 
 Deletes requested via `--apagar` are limited to `allowed_delete` and never touch `forbidden_delete`.
 
