@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""fila (agent-queue) — a tiny queue for heavy shared resources (emulator, phone, RAM/disk)
+used by several Claude Code (or any) agents running on the same machine.
+
+Protocol (one line per call, short output so agents spend few tokens):
+  fila entrar  AGENT -r emulador|celular|pesado [--ram GB] [--disco GB] [--min N] [--motivo TXT]
+  fila esperar AGENT [--max MIN]       blocks until it is your turn (run it in background); exit 0 = your turn
+  fila renovar AGENT [--min N]         extends your lease (do it every ~20 min)
+  fila sair    AGENT [--apagar PATH ...]  releases; the daemon deletes what you list and calls the next one
+  fila status                          who holds what and who is waiting
+  fila protocolo                       prints this help
+English aliases: join / wait / renew / leave / status / help.
+AGENT = a stable name for your session (we use the tmux session name, so the daemon can ping you there).
+The daemon (fila-daemon) grants turns, frees disk/RAM first, pings you in your tmux pane, and asks a
+"keeper" session for help when it cannot free enough on its own.
+"""
+import argparse, fcntl, json, os, sys, time
+
+CONF = os.path.expanduser(os.environ.get("FILA_CONFIG", "~/.config/fila/config.json"))
+DEFAULTS = {
+    "state_dir": "~/.local/state/fila",
+    "resources": ["emulador", "celular", "pesado"],
+    # paths agents may ask the daemon to delete on release
+    "allowed_delete": ["~/Documentos/", "~/projects/", "~/.cache/", "/tmp/"],
+    # never deleted, even if listed
+    "forbidden_delete": ["~/Downloads", "~/.claude", "~/.android/avd", "~/.ssh", "~/.config"],
+}
+
+
+def conf():
+    c = dict(DEFAULTS)
+    try:
+        with open(CONF) as f:
+            c.update(json.load(f))
+    except FileNotFoundError:
+        pass
+    return c
+
+
+C = conf()
+BASE = os.path.expanduser(C["state_dir"])
+ESTADO = BASE + "/estado.json"
+TRAVA = BASE + "/estado.lock"
+RECURSOS = tuple(C["resources"])
+PERMITIDO = [os.path.expanduser(p) for p in C["allowed_delete"]]
+PROIBIDO = [os.path.expanduser(p).rstrip("/") for p in C["forbidden_delete"]]
+ALIAS = {"join": "entrar", "wait": "esperar", "renew": "renovar", "leave": "sair", "help": "protocolo"}
+
+
+def carregar():
+    try:
+        with open(ESTADO) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def salvar(e):
+    tmp = ESTADO + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(e, f, indent=1)
+    os.replace(tmp, ESTADO)
+
+
+class Travado:
+    """Exclusive lock around the shared state file."""
+    def __enter__(self):
+        os.makedirs(BASE, exist_ok=True)
+        self.f = open(TRAVA, "a+")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+        self.e = carregar()
+        self.e.setdefault("fila", {}); self.e.setdefault("dono", {}); self.e.setdefault("apagar", [])
+        for r in RECURSOS:
+            self.e["fila"].setdefault(r, []); self.e["dono"].setdefault(r, None)
+        return self.e
+
+    def __exit__(self, *a):
+        salvar(self.e)
+        fcntl.flock(self.f, fcntl.LOCK_UN); self.f.close()
+
+
+def hhmm(t):
+    return time.strftime("%H:%M", time.localtime(t))
+
+
+def onde(e, agente):
+    for r in RECURSOS:
+        d = e["dono"][r]
+        if d and d["agente"] == agente:
+            return r, 0, d
+        for i, p in enumerate(e["fila"][r]):
+            if p["agente"] == agente:
+                return r, i + 1, p
+    return None, None, None
+
+
+def linha_status(e):
+    out = []
+    for r in RECURSOS:
+        d = e["dono"][r]
+        dono = f"{d['agente']} até {hhmm(d['ate'])}" if d else "livre"
+        esp = ",".join(p["agente"] for p in e["fila"][r]) or "-"
+        out.append(f"{r}: {dono} | espera: {esp}")
+    return "\n".join(out)
+
+
+def caminho_ok(c):
+    c = os.path.realpath(os.path.expanduser(c))
+    if any(c == p or c.startswith(p + "/") for p in PROIBIDO):
+        return False
+    return any(c.startswith(p) for p in PERMITIDO) and c.count("/") >= 3
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ALIAS:
+        sys.argv[1] = ALIAS[sys.argv[1]]
+    ap = argparse.ArgumentParser(prog="fila")
+    ap.add_argument("cmd", choices=["entrar", "esperar", "renovar", "sair", "status", "protocolo"])
+    ap.add_argument("agente", nargs="?")
+    ap.add_argument("-r", "--recurso", default=RECURSOS[-1], choices=RECURSOS)
+    ap.add_argument("--ram", type=float, default=4)
+    ap.add_argument("--disco", type=float, default=5)
+    ap.add_argument("--min", type=int, default=45)
+    ap.add_argument("--max", type=int, default=600)
+    ap.add_argument("--motivo", default="")
+    ap.add_argument("--apagar", nargs="*", default=[])
+    a = ap.parse_args()
+
+    if a.cmd == "protocolo":
+        print(__doc__.strip()); return 0
+    if a.cmd == "status":
+        with Travado() as e:
+            print(linha_status(e))
+        return 0
+    if not a.agente:
+        print("FILA erro: falta AGENTE (nome da sua sessão)"); return 1
+
+    if a.cmd == "entrar":
+        with Travado() as e:
+            r, pos, item = onde(e, a.agente)
+            if r is None:
+                e["fila"][a.recurso].append({"agente": a.agente, "ram": a.ram, "disco": a.disco, "min": a.min,
+                                             "motivo": a.motivo[:120], "desde": time.time()})
+                r, pos, item = onde(e, a.agente)
+            if pos == 0:
+                print(f"FILA {'preparando' if item.get('preparando') else 'vez'} {r} até {hhmm(item['ate'])}")
+            else:
+                d = e["dono"][r]
+                print(f"FILA pos {pos}/{len(e['fila'][r])} {r} (dono: {d['agente'] if d else 'livre'})")
+        return 0
+
+    if a.cmd == "esperar":
+        fim = time.time() + a.max * 60
+        pos = r = None
+        while time.time() < fim:
+            with Travado() as e:
+                r, pos, item = onde(e, a.agente)
+            if r is None:
+                print("FILA erro: você não está na fila (use fila entrar)"); return 1
+            if pos == 0 and not item.get("preparando"):
+                print(f"FILA vez {r} até {hhmm(item['ate'])} ram_livre={item.get('ram_livre', '?')}G "
+                      f"disco_livre={item.get('disco_livre', '?')}G {item.get('aviso', '')}".strip())
+                return 0
+            time.sleep(5)
+        print(f"FILA ainda pos {pos} {r}"); return 2
+
+    if a.cmd == "renovar":
+        with Travado() as e:
+            r, pos, item = onde(e, a.agente)
+            if pos != 0:
+                print("FILA erro: não é sua vez"); return 1
+            item["ate"] = time.time() + a.min * 60
+            item["visto"] = time.time()
+            print(f"FILA ok até {hhmm(item['ate'])}")
+        return 0
+
+    if a.cmd == "sair":
+        ok, ruim = [], []
+        for c in a.apagar:
+            (ok if caminho_ok(c) else ruim).append(os.path.realpath(os.path.expanduser(c)))
+        with Travado() as e:
+            r, pos, item = onde(e, a.agente)
+            if r is not None:
+                if pos == 0:
+                    e["dono"][r] = None
+                else:
+                    e["fila"][r] = [p for p in e["fila"][r] if p["agente"] != a.agente]
+            e["apagar"].extend(ok)
+        msg = f"FILA saiu {r or '-'}"
+        if ok: msg += f" apagar={len(ok)}"
+        if ruim: msg += f" recusado={','.join(ruim)}"
+        print(msg); return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

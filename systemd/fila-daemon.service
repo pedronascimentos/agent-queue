@@ -1,0 +1,11 @@
+[Unit]
+Description=agent-queue: shared emulator/phone/RAM/disk queue for coding agents
+
+[Service]
+ExecStart=/usr/bin/python3 @BIN@/fila-daemon
+Restart=always
+RestartSec=3
+Environment=PATH=@BIN@:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target

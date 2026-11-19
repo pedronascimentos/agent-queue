@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""fila-daemon (agent-queue): grants turns for the `fila` queue, frees disk/RAM before each turn,
+deletes what agents hand back, expires stale leases and pings each agent in its own tmux pane.
+If it cannot free enough by itself, it pings the "keeper" session (an agent you leave in charge
+of the machine). Optional: interrupts sessions that must stay idle (e.g. old copies of a conversation).
+Config: ~/.config/fila/config.json (see config.example.json). Nothing is killed except orphan
+emulators when RAM is short for an emulator turn."""
+import glob, importlib.machinery, importlib.util, os, shutil, subprocess, time
+
+_p = os.path.join(os.path.dirname(os.path.realpath(__file__)), "fila")
+_l = importlib.machinery.SourceFileLoader("fila", _p)
+fila = importlib.util.module_from_spec(importlib.util.spec_from_loader("fila", _l)); _l.exec_module(fila)
+
+C = fila.C
+LOG = fila.BASE + "/log"
+TMUX = ["tmux"] + (["-L", C["tmux_socket"]] if C.get("tmux_socket") else [])
+KEEPER = C.get("keeper_session")                  # e.g. "recover"; None = nobody to ping
+KEEP_IDLE = C.get("keep_idle_sessions", [])       # sessions that must not work (interrupted with Esc)
+RUST = [os.path.expanduser(p) for p in C.get("rust_targets", [])]
+EMU_LOCK = os.path.expanduser(C.get("emulator_lock", "/tmp/fila-emulador.lock"))
+GB = 1024 ** 3
+
+
+def log(m):
+    with open(LOG, "a") as f:
+        f.write(time.strftime("%m-%d %H:%M:%S ") + m + "\n")
+
+
+def sh(c, t=300):
+    try:
+        return subprocess.run(c, shell=True, capture_output=True, text=True, timeout=t).stdout
+    except Exception as e:
+        return str(e)
+
+
+def ram_livre():
+    for l in open("/proc/meminfo"):
+        if l.startswith("MemAvailable:"):
+            return int(l.split()[1]) * 1024 / GB
+    return 0
+
+
+def disco_livre():
+    s = os.statvfs(os.path.expanduser("~"))
+    return s.f_bavail * s.f_frsize / GB
+
+
+def tmux_ok(s):
+    return subprocess.run(TMUX + ["has-session", "-t", s], capture_output=True).returncode == 0
+
+
+def tela(s):
+    return subprocess.run(TMUX + ["capture-pane", "-p", "-t", s], capture_output=True, text=True).stdout
+
+
+def avisar(s, msg):
+    """Type a message into an agent's tmux pane (Claude Code queues it if the agent is busy)."""
+    if not s or not tmux_ok(s):
+        return
+    t = TMUX + ["send-keys", "-t", s]
+    subprocess.run(t + ["C-u"]); subprocess.run(t + ["-l", msg]); time.sleep(0.5); subprocess.run(t + ["Enter"])
+
+
+def gradle_rodando():
+    for p in glob.glob("/proc/[0-9]*/cmdline"):
+        try:
+            c = open(p, "rb").read()
+        except Exception:
+            continue
+        if b"org.gradle.launcher.daemon" in c or b"GradleWrapperMain" in c:
+            return True
+    return False
+
+
+def limpar_disco(precisa):
+    """Safe, regenerable cleanups, cheapest first, until `precisa` GB are free."""
+    h = os.path.expanduser
+    passos = [
+        ("npm cache", lambda: shutil.rmtree(h("~/.npm/_cacache"), ignore_errors=True)),
+        ("docker build cache + dangling images", lambda: sh("docker builder prune -af; docker image prune -f")),
+        ("Gradle per-version caches", lambda: None if gradle_rodando() else
+            [shutil.rmtree(d, ignore_errors=True) for d in glob.glob(h("~/.gradle/caches/[0-9]*.[0-9]*"))
+             + glob.glob(h("~/.gradle/caches/transforms-*")) + glob.glob(h("~/.gradle/caches/build-cache-*"))]),
+        ("stale Rust incremental (>2h)", lambda: [sh(
+            f"cd '{d}' 2>/dev/null && for c in incremental/*/; do ls -dt \"$c\"s-* 2>/dev/null | tail -n +2 | "
+            "while read s; do [ -n \"$(find \"$s\" -maxdepth 0 -mmin +120)\" ] && rm -rf \"$s\"; done; done")
+            for t in RUST for d in (t + "/debug", t + "/release")]),
+    ]
+    feito = []
+    for nome, f in passos:
+        if disco_livre() >= precisa:
+            break
+        f(); feito.append(nome)
+    return feito
+
+
+def liberar_ram(precisa, recurso):
+    feito = []
+    if ram_livre() < precisa:
+        sh("sync"); feito.append("sync")
+    if ram_livre() < precisa and recurso == "emulador":
+        # only the emulator holder may have an emulator running
+        for p in sh("pgrep -f '^/[^ ]*qemu-system'").split():
+            sh(f"kill -TERM {p}"); feito.append(f"orphan emulator {p}")
+        time.sleep(5)
+    return feito
+
+
+def conceder(r, item):
+    ag = item["agente"]
+    pr, pd = float(item.get("ram", 4)), float(item.get("disco", 5))
+    feito = limpar_disco(pd + 3) if disco_livre() < pd + 3 else []
+    feito += liberar_ram(pr, r)
+    rl, dl = round(ram_livre(), 1), round(disco_livre(), 1)
+    aviso = ""
+    if rl < pr or dl < pd:
+        aviso = f"curto(pediu ram {pr}G disco {pd}G)"
+        avisar(KEEPER, f"[fila] {ag} recebeu {r} mas falta recurso: RAM livre {rl}G (pediu {pr}G), disco livre {dl}G "
+                       f"(pediu {pd}G). Libere o que for seguro e responda nada; o daemon segue sozinho.")
+    item.update({"ate": time.time() + 60 * int(item.get("min", 45)), "visto": time.time(),
+                 "ram_livre": rl, "disco_livre": dl, "aviso": aviso, "inicio": time.time()})
+    log(f"VEZ {r} -> {ag} ram {rl}G disco {dl}G {('feito: ' + ', '.join(feito)) if feito else ''} {aviso}")
+    if r == "emulador":
+        with open(EMU_LOCK, "w") as f:
+            f.write(f"{ag} fila até {fila.hhmm(item['ate'])}\n")
+    avisar(ag, f"[fila] SUA VEZ: {r} até {fila.hhmm(item['ate'])} (RAM livre {rl}G, disco {dl}G). "
+               f"Use agora; renove com `fila renovar {ag}`; ao terminar: salve e rode `fila sair {ag} --apagar <o que pode apagar>`.")
+
+
+def rm_lock():
+    try:
+        os.remove(EMU_LOCK)
+    except Exception:
+        pass
+
+
+def ciclo(ocupado_antes):
+    with fila.Travado() as e:
+        apagar, e["apagar"] = e["apagar"], []
+        agora = time.time()
+        for r in fila.RECURSOS:
+            d = e["dono"][r]
+            if d and agora > d["ate"]:
+                log(f"PRAZO vencido {r} {d['agente']}: liberado")
+                avisar(d["agente"], f"[fila] seu prazo do {r} venceu e a vez passou adiante. "
+                                    f"Se ainda precisa: `fila entrar {d['agente']} -r {r}`.")
+                e["dono"][r] = None
+            if e["dono"][r] is None and r == "emulador":
+                rm_lock()
+        pend = [(r, e["fila"][r].pop(0)) for r in fila.RECURSOS if e["dono"][r] is None and e["fila"][r]]
+        for r, item in pend:
+            item["preparando"] = True; item["ate"] = time.time() + 600
+            e["dono"][r] = item
+    for c in apagar:
+        if fila.caminho_ok(c):
+            if os.path.isdir(c):
+                shutil.rmtree(c, ignore_errors=True)
+            elif os.path.exists(c):
+                os.remove(c)
+            log(f"APAGADO {c}")
+    for r, item in pend:
+        conceder(r, item)
+        item.pop("preparando", None)
+        with fila.Travado() as e:
+            if e["dono"][r] and e["dono"][r]["agente"] == item["agente"]:
+                e["dono"][r] = item
+    # sessions that must stay idle: interrupt (Esc) if busy on two checks in a row
+    agora_ocupado = set()
+    for s in KEEP_IDLE:
+        if tmux_ok(s) and "esc to interrupt" in tela(s):
+            agora_ocupado.add(s)
+            if s in ocupado_antes:
+                subprocess.run(TMUX + ["send-keys", "-t", s, "Escape"])
+                log(f"PARADA {s} (sessão que deve ficar parada)")
+    return agora_ocupado
+
+
+def main():
+    os.makedirs(fila.BASE, exist_ok=True)
+    log("daemon iniciado")
+    ocup = set()
+    while True:
+        try:
+            ocup = ciclo(ocup)
+        except Exception as ex:
+            log(f"erro {ex}")
+        time.sleep(3)
+
+
+if __name__ == "__main__":
+    main()
